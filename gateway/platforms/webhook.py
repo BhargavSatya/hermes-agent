@@ -41,6 +41,7 @@ from gateway.platforms.tcp_site import start_tcp_site
 from gateway.platforms.webhook_coalesce import WebhookCoalescer, validate_coalesce_config
 from gateway.platforms.webhook_filters import DEFAULT_SCRIPT_TIMEOUT_SECONDS, WebhookRouteProcessor
 from gateway.response_filters import is_autonomous_silence_response
+from media_constants import MEDIA_IMAGE_EXTS, MEDIA_VIDEO_EXTS
 
 logger = logging.getLogger(__name__)
 
@@ -53,12 +54,6 @@ _BUILTIN_DELIVER_PLATFORMS = {
     "telegram", "discord", "slack", "signal", "sms", "whatsapp", "matrix", "mattermost",
     "email", "dingtalk", "feishu", "wecom", "wecom_callback", "weixin",
     "bluebubbles", "qqbot", "yuanbao"}
-
-# Extension sets for _send_cross_platform_media's by-kind routing; kept in sync with
-# cron.scheduler_delivery's _VIDEO_EXTS / _IMAGE_EXTS so webhook cross-platform deliveries pick
-# the same native sender (send_image_file/send_video/send_document) as every other delivery path.
-_CROSS_PLATFORM_VIDEO_EXTS = frozenset({".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"})
-_CROSS_PLATFORM_IMAGE_EXTS = frozenset({".jpg", ".jpeg", ".png", ".webp", ".gif"})
 
 # ``None`` → aiohttp binds BOTH address families. "0.0.0.0" is IPv4-only (unreachable on IPv6-only
 # networks such as Fly.io 6PN); "::" becomes IPv6-only where the kernel sets IPV6_V6ONLY=1, breaking
@@ -953,10 +948,11 @@ class WebhookAdapter(BasePlatformAdapter):
         # Send ``text`` (if any) then every extracted MEDIA file via the adapter's native per-kind
         # sender, mirroring cron's _send_media_via_adapter routing (image/video/voice/document by
         # extension, with Telegram's voice-tag + MP3/M4A rules via should_send_media_as_audio).
-        # Returns the LAST send's result so success/failure still surfaces to the caller; a failed
-        # attachment does not stop the rest from being attempted.
+        # A failed attachment does not stop the rest from being attempted; failures remain visible
+        # even when a later attachment succeeds.
         from gateway.platforms.base import should_send_media_as_audio
         result: SendResult = SendResult(success=True)
+        errors: list[str] = []
         if text and text.strip():
             result = await adapter.send(chat_id, text, metadata=metadata)
             if not result.success:
@@ -965,9 +961,9 @@ class WebhookAdapter(BasePlatformAdapter):
             ext = os.path.splitext(media_path)[1].lower()
             if should_send_media_as_audio(target_platform, ext, is_voice=is_voice):
                 method, path_kw = "send_voice", "audio_path"
-            elif ext in _CROSS_PLATFORM_VIDEO_EXTS:
+            elif ext in MEDIA_VIDEO_EXTS:
                 method, path_kw = "send_video", "video_path"
-            elif ext in _CROSS_PLATFORM_IMAGE_EXTS:
+            elif ext in MEDIA_IMAGE_EXTS:
                 method, path_kw = "send_image_file", "image_path"
             else:
                 method, path_kw = "send_document", "file_path"
@@ -978,6 +974,10 @@ class WebhookAdapter(BasePlatformAdapter):
                 result = SendResult(success=False, error=f"{method} failed: {e}")
             if not result.success:
                 logger.warning("[webhook] cross-platform media delivery failed for %s: %s", media_path, result.error)
+                detail = result.error or "adapter returned failure without an error"
+                errors.append(f"{method} failed for {os.path.basename(media_path)}: {detail}")
+        if errors:
+            return SendResult(success=False, error="; ".join(errors))
         return result
 
     def _delivery_config(self, profile: Optional[str]):

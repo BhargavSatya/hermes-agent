@@ -947,6 +947,103 @@ class TestDeliverCrossPlatformMedia:
         assert mock_target.send_video.await_args.kwargs["video_path"] == str(clip)
         mock_target.send.assert_not_awaited()  # no text, media-only message
 
+    @pytest.mark.asyncio
+    async def test_mixed_media_routes_each_attachment_and_succeeds(self, tmp_path):
+        adapter, mock_target = self._setup_adapter_with_mock_target()
+        image = tmp_path / "photo.webp"
+        video = tmp_path / "clip.webm"
+        document = tmp_path / "notes.pdf"
+        for path in (image, video, document):
+            path.write_bytes(b"media")
+        result = await adapter._deliver_cross_platform(
+            "telegram", f"MEDIA:{image} MEDIA:{video} MEDIA:{document}",
+            {"deliver_extra": {"chat_id": "12345"}},
+        )
+        assert result.success
+        assert mock_target.send_image_file.await_args.kwargs["image_path"] == str(image)
+        assert mock_target.send_video.await_args.kwargs["video_path"] == str(video)
+        assert mock_target.send_document.await_args.kwargs["file_path"] == str(document)
+
+    @pytest.mark.asyncio
+    async def test_voice_marker_and_telegram_audio_rule_use_voice_sender(self, tmp_path):
+        adapter, mock_target = self._setup_adapter_with_mock_target()
+        voice = tmp_path / "voice.ogg"
+        voice.write_bytes(b"audio")
+        telegram_audio = tmp_path / "audio.mp3"
+        telegram_audio.write_bytes(b"audio")
+        ordinary_audio = tmp_path / "recording.ogg"
+        ordinary_audio.write_bytes(b"audio")
+        delivery = {"deliver_extra": {"chat_id": "12345"}}
+        # The marker is message-global, so exercise its explicit route independently.
+        result = await adapter._deliver_cross_platform(
+            "telegram", f"MEDIA:{voice} [[audio_as_voice]]", delivery,
+        )
+        assert result.success
+        mock_target.send_voice.assert_awaited_once()
+        assert mock_target.send_voice.await_args.kwargs["audio_path"] == str(voice)
+        # Telegram's unmarked MP3 sendAudio rule also uses its voice sender.
+        result = await adapter._deliver_cross_platform("telegram", f"MEDIA:{telegram_audio}", delivery)
+        assert result.success
+        assert mock_target.send_voice.await_count == 2
+        assert mock_target.send_voice.await_args.kwargs["audio_path"] == str(telegram_audio)
+        # An unmarked OGG is not a voice bubble; it remains a document.
+        result = await adapter._deliver_cross_platform("telegram", f"MEDIA:{ordinary_audio}", delivery)
+        assert result.success
+        mock_target.send_document.assert_awaited_once()
+        assert mock_target.send_document.await_args.kwargs["file_path"] == str(ordinary_audio)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("failure_mode", ["result", "exception"])
+    async def test_failed_image_is_preserved_when_following_document_succeeds(
+        self, tmp_path, failure_mode,
+    ):
+        adapter, mock_target = self._setup_adapter_with_mock_target()
+        image = tmp_path / "broken.png"
+        document = tmp_path / "report.pdf"
+        image.write_bytes(b"image")
+        document.write_bytes(b"pdf")
+        if failure_mode == "result":
+            mock_target.send_image_file.return_value = SendResult(success=False, error="upload rejected")
+        else:
+            mock_target.send_image_file.side_effect = RuntimeError("connection reset")
+        delivery = {"deliver_extra": {"chat_id": "12345"}, "mirror_to_session": "true"}
+        with patch.object(adapter, "_mirror_delivery") as mirror:
+            result = await adapter._deliver_cross_platform(
+                "telegram", f"MEDIA:{image} MEDIA:{document}", delivery,
+            )
+        assert not result.success
+        assert result.error
+        assert "broken.png" in result.error
+        expected_error = "upload rejected" if failure_mode == "result" else "connection reset"
+        assert expected_error in result.error
+        mock_target.send_document.assert_awaited_once()
+        assert mock_target.send_document.await_args.kwargs["file_path"] == str(document)
+        mirror.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_multiple_attachment_failures_are_all_returned(self, tmp_path):
+        adapter, mock_target = self._setup_adapter_with_mock_target()
+        image = tmp_path / "first.png"
+        video = tmp_path / "second.mp4"
+        document = tmp_path / "third.pdf"
+        for path in (image, video, document):
+            path.write_bytes(b"media")
+        mock_target.send_image_file.return_value = SendResult(success=False)
+        mock_target.send_video.side_effect = RuntimeError("video offline")
+        mock_target.send_document.return_value = SendResult(success=False, error="document refused")
+
+        result = await adapter._deliver_cross_platform(
+            "telegram", f"MEDIA:{image} MEDIA:{video} MEDIA:{document}",
+            {"deliver_extra": {"chat_id": "12345"}},
+        )
+        assert not result.success
+        for fragment in ("first.png", "send_image_file", "second.mp4", "video offline",
+                         "third.pdf", "document refused"):
+            assert fragment in result.error
+        mock_target.send_image_file.assert_awaited_once()
+        mock_target.send_video.assert_awaited_once()
+        mock_target.send_document.assert_awaited_once()
+
 
 class TestCrossPlatformDeliveryMirror:
     """An opted-in route's delivered response is appended to the TARGET chat's session (real state.db),
